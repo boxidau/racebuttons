@@ -16,6 +16,15 @@
         "string_view": "cpp",
         "initializer_list": "cpp",
         "ranges": "cpp",
-        "regex": "cpp"
+        "regex": "cpp",
+        "*.tcc": "cpp",
+        "cstddef": "cpp",
+        "optional": "cpp",
+        "istream": "cpp",
+        "system_error": "cpp",
+        "functional": "cpp",
+        "tuple": "cpp",
+        "type_traits": "cpp",
+        "utility": "cpp"
     }
 }
