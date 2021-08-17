@@ -174,7 +174,7 @@ bool CryptoRadio::receivePacket(Packet *packet)
                 
                 if (checksum != packet_checksum) {
                     Serial.println("[RADIO] checksum failure, ignoring packet");
-                    return false;
+                    receivedPacket = false;
                 }
             }
 
