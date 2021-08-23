@@ -1,3 +1,6 @@
+#define USE_SX1278_RADIO 0
+#define USE_E32_RADIO 1
+
 #include <constants.h>
 #include <structures.h>
 
@@ -5,92 +8,150 @@
 #include <EEPROM.h>
 #include <Adafruit_NeoPixel.h>
 #include <cryptoradio.h>
+#include <buzzer.h>
+
+#if USE_SX1278_RADIO
+#include <SX1278Radio.h>
+SX1278Radio radio_module;
+#elif USE_E32_RADIO
+#include <E32Radio.h>
+E32Radio radio_module;
+#else
+#include <DummyRadio.h>
+DummyRadio radio_module;
+#endif
 
 // LED Strip Setup
 Adafruit_NeoPixel strip = Adafruit_NeoPixel(16, PIN_LED_STRIP, NEO_GRB + NEO_KHZ800);
 
+const uint32_t kDimPurple = strip.Color(20, 0, 20);
+const uint32_t kDimGreen = strip.Color(0, 20, 0);
+const uint32_t kWhite = strip.Color(255, 255, 255);
+const uint32_t kRed = strip.Color(255, 0, 0);
+const uint32_t kBlue = strip.Color(0, 0, 255);
+const uint32_t kYellow = strip.Color(255, 200, 0);
+const uint32_t kDimOrange = strip.Color(20, 9, 0);
 
-Button buttons[BUTTON_COUNT] = {
-    Button{PIN_D1, 0, 8, strip.Color(150, 150, 150)},
-    Button{A0, 2, 10, strip.Color(150, 0, 0)},
-    Button{PIN_D4, 5, 13, strip.Color(0, 0, 150)},
-    Button{PIN_D3, 7, 15, strip.Color(190, 150, 0)},
+RaceButton buttons[BUTTON_COUNT] = {
+    RaceButton{PIN_BLACK, 0, 8, kWhite},
+    RaceButton{PIN_RED, 2, 10, kRed},
+    RaceButton{PIN_BLUE, 5, 13, kBlue},
+    RaceButton{PIN_YELLOW, 7, 15, kYellow},
 };
 
-const int eeprom_local_val_idx = 0;
+const int eeprom_local_val_idx = 64;
 const int eeprom_pairing_info_idx = 8;
+const int eeprom_brightness_val_idx = 120;
 
-// Poll Timer
-unsigned long broadcast_timer = 0;
+elapsedMillis broadcast_timer;
+elapsedMillis dead_comms_timer;
+elapsedMillis reset_timer;
+elapsedMillis brightness_timer;
 
-// Dead comms timer
-unsigned long dead_comms_timer = 0;
+elapsedMillis tx_led;
+elapsedMillis rx_led;
+
+elapsedMillis respond_timer;
+bool should_respond = false;
+bool brightness = true;
 
 bool base_station = false;
 
 PairingInfo pairing_info;
-CryptoRadio cr;
+CryptoRadio cr = CryptoRadio(&radio_module);
+
+Buzzer buzzer = Buzzer(BUZZER_PIN);
 
 void broadcastStatus()
 {
     Packet p = {pairing_info.remote_address, 0, PACKET_TYPE_STATE};
     p.data[0] = packBitmap(buttons, BUTTON_COUNT);
-    cr.sendPacket(&p);
+    tx_led = 0;
+    if (!cr.sendPacket(&p))
+    {
+        Serial.println("[ERROR] sending packet");
+    }
 }
 
 void readPairingInfo()
 {
+    EEPROM.begin();
     byte pairing_info_raw[sizeof(PairingInfo)];
-    for (int i = 0; i < sizeof(PairingInfo); i++) {
-        pairing_info_raw[i] = EEPROM.read(eeprom_pairing_info_idx + i);
+    for (int i = 0; i < sizeof(PairingInfo); i++)
+    {
+        noInterrupts();
+        auto res = EEPROM.read(eeprom_pairing_info_idx + i);
+        interrupts();
+        pairing_info_raw[i] = res;
+        Serial.print("EEPROM reading from offset: ");
+        Serial.print(eeprom_pairing_info_idx + i);
+        Serial.print(" val: ");
+        Serial.println(res, HEX);
     }
     memcpy(&pairing_info, pairing_info_raw, sizeof(PairingInfo));
 }
 
 void writePairingInfo()
 {
-    for (int i = 0; i < sizeof(PairingInfo); i++) {
-        EEPROM.write(eeprom_pairing_info_idx + i, ((byte*)&pairing_info)[i]);
+    byte pairing_info_raw[sizeof(PairingInfo)];
+    memcpy(pairing_info_raw, &pairing_info, sizeof(PairingInfo));
+    EEPROM.begin();
+    for (int i = 0; i < sizeof(PairingInfo); i++)
+    {
+        Serial.print("EEPROM Writing to offset: ");
+        Serial.print(eeprom_pairing_info_idx + i);
+        Serial.print(" val: ");
+        Serial.println(pairing_info_raw[i], HEX);
+        noInterrupts();
+        EEPROM.write(eeprom_pairing_info_idx + i, pairing_info_raw[i]);
+        interrupts();
     }
-    EEPROM.commit();
 }
 
 // Setup function
 void setup()
 {
-    strip.begin();
-    strip.setBrightness(STRIP_BRIGHTNESS);
-    strip.show(); // Initialize all pixels to 'off'
-    
     Serial.begin(115200);
-    while (!Serial)
-    {
-        delay(200);
-    }
-    
+    EEPROM.begin();
+
+    pinMode(HEALTH_LED, OUTPUT);
+    digitalWrite(HEALTH_LED, HIGH);
+
     for (uint8_t i = 0; i < BUTTON_COUNT; i++)
     {
         pinMode(buttons[i].pin, INPUT_PULLUP);
+        buttons[i].bounce.interval(DEBOUNCE_TIME);
+        buttons[i].bounce.attach(buttons[i].pin);
     }
 
-    EEPROM.begin(512);
+    strip.begin();
+    brightness = EEPROM.read(eeprom_brightness_val_idx);
+    strip.setBrightness(brightness ? STRIP_BRIGHTNESS : STRIP_BRIGHTNESS_DIM);
+    strip.show(); // Initialize all pixels to 'off'
+
+    // allow for yellow button to pause setup()
+    while (!digitalRead(PIN_YELLOW))
+    {
+    }
+    Serial.println("initializing...");
+
     readPairingInfo();
+    cr.setEncryptionKey(pairing_info.shared_key);
+    cr.begin();
 
-    Serial.print(F("[SX1278] Initializing ... "));
-    cr.begin(pairing_info.shared_key);
-
-    if (!digitalRead(PIN_D1))
+    if (!digitalRead(PIN_BLACK))
     {
         // enter pairing mode
         strip.fill(strip.Color(0, 40, 40));
         strip.show();
         Serial.println("Entering pairing mode...");
-        
-        if (cr.pairingMode(&pairing_info)) {
+
+        if (cr.pairingMode(&pairing_info))
+        {
             strip.fill(strip.Color(0, 40, 0));
             writePairingInfo();
         }
-        else 
+        else
         {
             strip.fill(strip.Color(40, 0, 0));
         }
@@ -98,9 +159,12 @@ void setup()
         delay(1000);
         strip.clear();
     }
-    
+
+    uint16_t local_address = cr.getAddress();
     Serial.print("Pairing info - remote addr: ");
-    Serial.print(pairing_info.remote_address);
+    Serial.print(pairing_info.remote_address, HEX);
+    Serial.print(" local address: ");
+    Serial.print(local_address, HEX);
     Serial.print(" shared key: ");
     for (int i = 0; i < 32; i++)
     {
@@ -109,35 +173,101 @@ void setup()
     }
     Serial.println("");
 
-    if (pairing_info.base_station) {
+    if (pairing_info.remote_address > local_address)
+    {
         Serial.println("This is the base station!");
-    } else {
+        base_station = true;
+    }
+    else
+    {
         Serial.println("This is a remote node!");
     }
 
     // load from local storage
     unpackBitmap(EEPROM.read(eeprom_local_val_idx), LOCAL_STATE, buttons, BUTTON_COUNT);
-
+    buzzer.beep(100);
 }
 
-// Loop function
+void detectRebootRequest()
+{
+    if (!digitalRead(buttons[2].pin) && !digitalRead(buttons[3].pin))
+    {
+        if (reset_timer > 2000)
+        {
+            _reboot_Teensyduino_();
+        }
+        strip.fill(strip.Color(40, 40, 0));
+    }
+    else
+    {
+        reset_timer = 0;
+    }
+}
+
+void detectBrightnessRequest()
+{
+    if (!digitalRead(buttons[3].pin))
+    {
+        if (brightness_timer > 2000)
+        {
+            brightness = !brightness;
+            brightness_timer = 0;
+            EEPROM.update(eeprom_brightness_val_idx, brightness);
+        }
+    }
+    else
+    {
+        brightness_timer = 0;
+    }
+}
+
+void showCommsStatus()
+{
+    if (dead_comms_timer > DEAD_COMMS_INTERVAL)
+    {
+        strip.setPixelColor(3, kDimPurple);
+        strip.setPixelColor(4, kDimPurple);
+        if (base_station)
+        {
+            strip.setPixelColor(11, kDimPurple);
+            strip.setPixelColor(12, kDimPurple);
+        }
+    }
+    else
+    {
+        strip.setPixelColor(3, kDimGreen);
+        strip.setPixelColor(4, kDimGreen);
+        if (base_station)
+        {
+            strip.setPixelColor(11, kDimGreen);
+            strip.setPixelColor(12, kDimGreen);
+        }
+    }
+}
+
+void showRXTXIndicators()
+{
+    if (!base_station)
+        return;
+    if (tx_led < 100)
+    {
+        strip.setPixelColor(6, kDimOrange);
+    }
+    if (rx_led < 100)
+    {
+        strip.setPixelColor(14, kDimOrange);
+    }
+}
+
 void loop()
 {
+    buzzer.update();
+    strip.clear();
     for (uint8_t i = 0; i < BUTTON_COUNT; i++)
     {
-        int pulled_low = !digitalRead(buttons[i].pin);
-        if (buttons[i].pin == A0) {
-            pulled_low = analogRead(A0) < 100;
-        }
-        auto press_time = millis();
-        if (press_time > (buttons[i]._debounce_timer + DEBOUNCE_TIME) && buttons[i]._pressed != pulled_low)
+        if (buttons[i].bounce.update() && buttons[i].bounce.fell())
         {
-            buttons[i]._debounce_timer = press_time;
-            buttons[i]._pressed = pulled_low;
-            if (pulled_low)
-            {
-                buttons[i].local_status = !buttons[i].local_status;
-            }
+            buttons[i].local_status = !buttons[i].local_status;
         }
 
         strip.setPixelColor(
@@ -148,43 +278,51 @@ void loop()
             buttons[i].remote_led_index,
             buttons[i].remote_status ? buttons[i].color : 0);
     }
-
-    if (millis() > (dead_comms_timer + DEAD_COMMS_INTERVAL)) {
-        strip.setPixelColor(3, strip.Color(20, 0, 20));
-        strip.setPixelColor(4, strip.Color(20, 0, 20));
-        strip.setPixelColor(11, strip.Color(20, 0, 20));
-        strip.setPixelColor(12, strip.Color(20, 0, 20));
-    } else {
-        strip.setPixelColor(3, strip.Color(0, 20, 0));
-        strip.setPixelColor(4, strip.Color(0, 20, 0));
-        strip.setPixelColor(11, strip.Color(0, 20, 0));
-        strip.setPixelColor(12, strip.Color(0, 20, 0));
-    }
-
+    showCommsStatus();
+    showRXTXIndicators();
+    detectRebootRequest();
+    detectBrightnessRequest();
+    strip.setBrightness(brightness ? STRIP_BRIGHTNESS : STRIP_BRIGHTNESS_DIM);
     strip.show();
 
-    if (millis() > broadcast_timer + BROADCAST_INTERVAL)
+    if (broadcast_timer > BROADCAST_INTERVAL)
     {
-        broadcast_timer = millis();
-        if (pairing_info.base_station)
+        digitalWrite(HEALTH_LED, !digitalRead(HEALTH_LED));
+        broadcast_timer = 0;
+        if (base_station)
         {
             broadcastStatus();
         }
         uint8_t cur_val = packBitmap(buttons, BUTTON_COUNT);
-        if (EEPROM.read(eeprom_local_val_idx) != cur_val) {
-            EEPROM.write(eeprom_local_val_idx, cur_val);
-            EEPROM.commit();
-        }
+        EEPROM.update(eeprom_local_val_idx, cur_val);
     }
 
+    if (should_respond && respond_timer > 10)
+    {
+        should_respond = false;
+        broadcastStatus();
+    }
 
     static Packet packet;
-    if (cr.receivePacket(&packet) && packet.packet_type == PACKET_TYPE_STATE) {
-        unpackBitmap(packet.data[0], REMOTE_STATE, buttons, BUTTON_COUNT);
-        dead_comms_timer = millis();        
-        if (!pairing_info.base_station)
+    if (cr.receivePacket(&packet))
+    {
+        rx_led = 0;
+        switch (packet.packet_type)
         {
-            broadcastStatus();
+        case PACKET_TYPE_STATE:
+            unpackBitmap(packet.data[0], REMOTE_STATE, buttons, BUTTON_COUNT);
+            if (dead_comms_timer > DEAD_COMMS_INTERVAL) {
+                buzzer.beep(500);
+            }
+            dead_comms_timer = 0;
+            if (!base_station)
+            {
+                should_respond = true;
+                respond_timer = 0;
+            }
+            break;
+        default:
+            Serial.println("Received packet type without handler");
         }
     }
 }

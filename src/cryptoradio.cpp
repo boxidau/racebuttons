@@ -1,56 +1,48 @@
 #include <cryptoradio.h>
 
-// disable interrupt when it's not needed
-volatile static bool enableInterrupt = true;
-// flag to indicate that a packet was received
-volatile static bool receivedFlag;
-
 AES256 aes256;
 FastCRC16 CRC16;
 
 byte CryptoRadio::encryption_key[32];
-SX1278 CryptoRadio::radio = new Module(SX_NSS, SX_DIO0, SX_RST);
+AbstractRadio* CryptoRadio::radio;
 
-IRAM_ATTR void setFlag(void)
-{
-    // check if the interrupt is enabled
-    if (!enableInterrupt)
-    {
-        return;
+uint16_t CryptoRadio::getAddress() {
+
+    static uint32_t addr;
+    if (addr > 0) {
+        return (uint16_t)addr;
     }
-    // we got a packet, set the flag
-    receivedFlag = true;
+
+    uint32_t num = 0;
+	__disable_irq();
+    FTFL_FSTAT = FTFL_FSTAT_RDCOLERR | FTFL_FSTAT_ACCERR | FTFL_FSTAT_FPVIOL;
+    FTFL_FCCOB0 = 0x41;
+    FTFL_FCCOB1 = 15;
+    FTFL_FSTAT = FTFL_FSTAT_CCIF;
+    while (!(FTFL_FSTAT & FTFL_FSTAT_CCIF)) ; // wait
+    num = *(uint32_t *)&FTFL_FCCOB7;
+	__enable_irq();
+    addr = (uint16_t)num;
+    return addr;
 }
 
-void CryptoRadio::begin(byte _encryption_key[32])
+CryptoRadio::CryptoRadio(AbstractRadio *_radio)
+{
+    radio = _radio;
+}
+
+void CryptoRadio::begin()
+{
+    Serial.println(F("[RADIO] Initializing ... "));
+    Serial.print("[RADIO] node address: ");
+    Serial.println(getAddress());
+    radio->begin();
+    radio->listen();
+}
+
+void CryptoRadio::setEncryptionKey(byte _encryption_key[32])
 {
     memcpy(encryption_key, _encryption_key, 32);
-    Serial.print(F("[RADIO] Initializing ... "));
-    int state = radio.begin(434.0, 125.0, 9, 7, SX127X_SYNC_WORD, 10, 8, 0);
-    if (state == ERR_NONE)
-    {
-        Serial.println(F("success!"));
-    }
-    else
-    {
-        Serial.print(F("failed, code "));
-        Serial.println(state);
-        while (true)
-            ;
-    }
-
-    radio.setDio0Action(setFlag);
-    radioListen();
-}
-
-void CryptoRadio::radioListen()
-{
-    int state = radio.startReceive();
-    if (state != ERR_NONE)
-    {
-        Serial.print(F("[RADIO] listen mode failed, code: "));
-        Serial.println(state);
-    }
 }
 
 bool isEncryptedPacketType(PacketType packet_type)
@@ -62,8 +54,10 @@ void printPacket(const Packet *packet, bool rx_tx)
 {
     Serial.print("[RADIO] ");
     Serial.print(rx_tx ? "RX" : "TX");
-    Serial.print(" packet dest: " + String(packet->destination));
-    Serial.print(", src: " + String(packet->source));
+    Serial.print(" packet dest: ");
+    Serial.print(packet->destination, HEX);
+    Serial.print(", src: ");
+    Serial.print(packet->source, HEX);
     Serial.print(F(", type: "));
     switch(packet->packet_type) {
         case PACKET_TYPE_PAIRING_REQUEST:
@@ -89,7 +83,7 @@ void printPacket(const Packet *packet, bool rx_tx)
 }
 
 bool CryptoRadio::sendPacket(Packet *packet) {
-    packet->source = (uint16_t)ESP.getChipId();
+    packet->source = getAddress();
     printPacket(packet, false);
 
     bool is_encrypted = isEncryptedPacketType(packet->packet_type);
@@ -115,105 +109,49 @@ bool CryptoRadio::sendPacket(Packet *packet) {
     
     byte* p_encoded = (byte*)packet;
 
-    enableInterrupt = false;
-    int state = radio.transmit(p_encoded, sizeof(Packet));
-    enableInterrupt = true;
-    radioListen();
-
-    if (state == ERR_TX_TIMEOUT)
-    {
-        // timeout occurred while transmitting packet
-        Serial.println(F("TX timeout!"));
-    }
-    else if (state != ERR_NONE)
-    {
-        // some other error occurred
-        Serial.print(F("TX failed, code "));
-        Serial.println(state);
-    }
-    return state == ERR_NONE;
+    bool result = radio->send(p_encoded, sizeof(Packet));
+    radio->listen();
+    return result;
 }
 
 bool CryptoRadio::receivePacket(Packet *packet)
 {
+    static byte raw_data[sizeof(Packet)];
     bool receivedPacket = false;
     // check if the flag is set
-    if (receivedFlag)
+    if (radio->receive(raw_data, sizeof(Packet)))
     {
-        // disable the interrupt service routine while
-        // processing the data
-        enableInterrupt = false;
-
-        // reset flag
-        receivedFlag = false;
-
-        byte raw_data[sizeof(Packet)];
-        // you can read received data as an Arduino String
-        int state = radio.readData(raw_data, sizeof(Packet));
-
-        if (state == ERR_NONE)
+        receivedPacket = true;
+        memcpy(packet, raw_data, sizeof(Packet));
+        if (packet->destination != getAddress() && packet->destination != RADIO_BROADCAST_ADDRESS)
         {
-            receivedPacket = true;
-            memcpy(packet, raw_data, sizeof(Packet));
+            Serial.print("invalid destination, dropping packet for ");
+            Serial.println(packet->destination, HEX);
+            return false;
+        }
 
-            bool is_encrypted = isEncryptedPacketType(packet->packet_type);
-            if (is_encrypted) {
-                byte decrypted_data[32];
-                aes256.setKey(encryption_key, aes256.keySize());
-                for (int i = 0; i < MAX_PACKET_DATA_LENGTH; i+=aes256.blockSize()) {
-                    byte buffer[16];
-                    aes256.decryptBlock(buffer, &packet->data[i]);
-                    memcpy(&decrypted_data[i], buffer, aes256.blockSize());
-                }
-
-                memcpy(packet->data, decrypted_data, MAX_PACKET_DATA_LENGTH);
-                
-                uint16_t checksum = CRC16.ccitt(packet->data, MAX_PACKET_DATA_LENGTH - 2);
-                uint16_t packet_checksum = packet->data[MAX_PACKET_DATA_LENGTH - 2];
-                packet_checksum |= (packet->data[MAX_PACKET_DATA_LENGTH - 1] << 8);
-                
-                if (checksum != packet_checksum) {
-                    Serial.println("[RADIO] checksum failure, ignoring packet");
-                    receivedPacket = false;
-                }
+        bool is_encrypted = isEncryptedPacketType(packet->packet_type);
+        if (is_encrypted) {
+            byte decrypted_data[32];
+            aes256.setKey(encryption_key, aes256.keySize());
+            for (int i = 0; i < MAX_PACKET_DATA_LENGTH; i+=aes256.blockSize()) {
+                byte buffer[16];
+                aes256.decryptBlock(buffer, &packet->data[i]);
+                memcpy(&decrypted_data[i], buffer, aes256.blockSize());
             }
 
-            printPacket(packet, true);
-    
-            // print RSSI (Received Signal Strength Indicator)
-            Serial.print(F("[RADIO] RSSI: "));
-            Serial.print(radio.getRSSI());
-            Serial.print(F(" dBm, "));
-
-            // print SNR (Signal-to-Noise Ratio)
-            Serial.print(F("SNR: "));
-            Serial.print(radio.getSNR());
-            Serial.print(F(" dB, "));
-
-            // print frequency error
-            Serial.print(F("Frequency error: "));
-            Serial.print(radio.getFrequencyError());
-            Serial.println(F(" Hz"));
+            memcpy(packet->data, decrypted_data, MAX_PACKET_DATA_LENGTH);
+            
+            uint16_t checksum = CRC16.ccitt(packet->data, MAX_PACKET_DATA_LENGTH - 2);
+            uint16_t packet_checksum = packet->data[MAX_PACKET_DATA_LENGTH - 2];
+            packet_checksum |= (packet->data[MAX_PACKET_DATA_LENGTH - 1] << 8);
+            
+            if (checksum != packet_checksum) {
+                Serial.println("[RADIO] checksum failure, ignoring packet");
+                receivedPacket = false;
+            }
         }
-        else if (state == ERR_CRC_MISMATCH)
-        {
-            // packet was received, but is malformed
-            Serial.println(F("[RADIO] CRC error!"));
-        }
-        else
-        {
-            // some other error occurred
-            Serial.print(F("[RADIO] Failed, code "));
-            Serial.println(state);
-        }
-
-        // we're ready to receive more packets,
-        // enable interrupt service routine
-        enableInterrupt = true;
-
-        // put module back to listen mode
-        radio.startReceive();
-
+        printPacket(packet, true);
     }
     return receivedPacket;
 }
@@ -229,7 +167,7 @@ bool CryptoRadio::pairingMode(PairingInfo *pairing_info)
     Serial.flush();
     Curve25519::dh1(local_k, local_f);
 
-    Packet p = {BROADCAST_ADDRESS, 0, PACKET_TYPE_PAIRING_REQUEST};
+    Packet p = {RADIO_BROADCAST_ADDRESS, 0, PACKET_TYPE_PAIRING_REQUEST};
     memcpy(p.data, local_k, 32);
 
     unsigned long interval_timer = 0;
@@ -291,8 +229,6 @@ bool CryptoRadio::pairingMode(PairingInfo *pairing_info)
         memcpy(pairing_info->shared_key, remote_k, 32);
         memcpy(encryption_key, remote_k, 32);
         pairing_info->remote_address = recv_packet.source;
-        pairing_info->base_station = (recv_packet.source < (uint16_t)ESP.getChipId());
-
         return true;
     }
     return false;

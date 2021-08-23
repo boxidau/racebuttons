@@ -5,20 +5,23 @@
 #include <RNG.h>
 #include <string.h>
 #include <Arduino.h>
-#include <RadioLib.h>
+#include <AbstractRadio.h>
 #include <structures.h>
 #include <FastCRC.h>
-
-void pairingMode();
-void testDH();
+#include <TeensyID.h>
 
 class CryptoRadio {
     public:
-        static void begin(byte _encryption_key[32]);
-        static SX1278 radio;
-        static void radioListen();
+        CryptoRadio(AbstractRadio*);
+        static void begin();
+        static void setEncryptionKey(byte _encryption_key[32]);
         static bool receivePacket(Packet*);
         static bool sendPacket(Packet*);
         static bool pairingMode(PairingInfo*);
+        static uint16_t getAddress();
+    private:
+        static AbstractRadio* radio;
         static byte encryption_key[32];
+        static byte local_nonce;
+        static byte remote_nonce;
 };

@@ -1,19 +1,18 @@
 #pragma once
 #include <Arduino.h>
+#include <Bounce2.h>
 #include <constants.h>
 
 // Button Setup
-struct Button
+struct RaceButton
 {
     int pin;
     int local_led_index;
     int remote_led_index;
     uint32_t color;
+    Bounce bounce;
     bool local_status;
     bool remote_status;
-
-    bool _pressed;
-    unsigned long _debounce_timer;
 };
 
 enum StateType
@@ -45,9 +44,8 @@ struct PairingInfo
 {
     uint16_t remote_address;
     uint8_t shared_key[32];
-    bool base_station;
 };
 #pragma pack(pop)
 
-uint8_t packBitmap(Button *buttons, uint8_t len);
-void unpackBitmap(uint8_t bitmap, StateType state_type, Button *buttons, uint8_t len);
+uint8_t packBitmap(RaceButton *buttons, uint8_t len);
+void unpackBitmap(uint8_t bitmap, StateType state_type, RaceButton *buttons, uint8_t len);

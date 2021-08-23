@@ -1,7 +1,7 @@
 #include <structures.h>
 
 
-uint8_t packBitmap(Button *buttons, uint8_t len)
+uint8_t packBitmap(RaceButton *buttons, uint8_t len)
 {
     uint8_t bitmap = 0;
     for (uint8_t i = 0; i < len; i++)
@@ -11,7 +11,7 @@ uint8_t packBitmap(Button *buttons, uint8_t len)
     return bitmap;
 }
 
-void unpackBitmap(uint8_t bitmap, StateType state_type, Button *buttons, uint8_t len)
+void unpackBitmap(uint8_t bitmap, StateType state_type, RaceButton *buttons, uint8_t len)
 {
     for (uint8_t i = 0; i < len; i++)
     {
